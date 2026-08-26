@@ -54,6 +54,7 @@ def _has_cli_overrides(args) -> bool:
         "host",
         "log_level",
         "sse_keepalive_mode",
+        "max_audio_upload_size",
         "max_concurrent_requests",
         "embedding_batch_size",
         "memory_guard",
@@ -1069,6 +1070,13 @@ Example directory structure:
         "protocol-aware no-op events compatible with strict clients like "
         "OpenClaw / WorkBuddy; 'comment' emits the legacy ': keep-alive' SSE "
         "comment; 'off' disables keepalive entirely",
+    )
+    serve_parser.add_argument(
+        "--max-audio-upload-size",
+        type=str,
+        default=None,
+        help="Maximum audio upload size for /v1/audio/transcriptions and "
+        "/v1/audio/process (e.g. '100MB', '500MB'). Default: 100MB",
     )
 
     # Scheduler options (for BatchedEngine)

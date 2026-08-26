@@ -314,6 +314,65 @@ class TestSTTEndpointBasic:
         )
         mock_pool.get_engine.assert_awaited()
 
+    def test_upload_exceeding_limit_returns_413(self, server_audio_client):
+        """A payload larger than the resolved limit is rejected with 413."""
+        client, _ = server_audio_client
+        oversized = b"\x00" * 2048
+        with patch(
+            "omlx.api.audio_routes._max_audio_upload_bytes",
+            return_value=1024,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", oversized, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+        assert response.status_code == 413
+        assert "1024" in response.json()["detail"]
+
+    def test_upload_within_raised_limit_returns_200(self, server_audio_client):
+        """Raising the limit allows an upload that the default cap would reject."""
+        client, _ = server_audio_client
+        with patch(
+            "omlx.api.audio_routes._max_audio_upload_bytes",
+            return_value=len(TINY_WAV) + 1,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+        assert response.status_code == 200
+
+    def test_uninitialized_settings_keep_default_limit(self):
+        """Without init_settings(), the 100MB default still applies."""
+        from omlx.api.audio_routes import (
+            MAX_AUDIO_UPLOAD_BYTES,
+            _max_audio_upload_bytes,
+        )
+        from omlx.settings import reset_settings
+
+        reset_settings()
+        assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
+        assert MAX_AUDIO_UPLOAD_BYTES == 100 * 1024 * 1024
+
+    def test_reads_limit_from_initialized_settings(self, tmp_path):
+        """init_settings() with a CLI override is what _read_upload enforces."""
+        from argparse import Namespace
+
+        from omlx.api.audio_routes import _max_audio_upload_bytes
+        from omlx.settings import init_settings, reset_settings
+
+        reset_settings()
+        try:
+            init_settings(
+                base_path=tmp_path,
+                cli_args=Namespace(max_audio_upload_size="2MB"),
+            )
+            assert _max_audio_upload_bytes() == 2 * 1024 * 1024
+        finally:
+            reset_settings()
+
     def test_language_parameter_accepted(self, server_audio_client):
         """language= form field is accepted without error."""
         client, _ = server_audio_client
