@@ -144,6 +144,13 @@ class TestServerSettings:
         settings = ServerSettings.from_dict({})
         assert settings.max_audio_upload_size == "100MB"
 
+    def test_max_audio_upload_bytes_rejects_non_positive(self):
+        """0MB / negative sizes parse as integers but are not usable limits."""
+        with pytest.raises(ValueError, match="must be positive"):
+            ServerSettings(max_audio_upload_size="0MB").max_audio_upload_bytes()
+        with pytest.raises(ValueError, match="must be positive"):
+            ServerSettings(max_audio_upload_size="-1MB").max_audio_upload_bytes()
+
     def test_from_dict(self):
         """Test creation from dictionary."""
         data = {"host": "0.0.0.0", "port": 9000, "log_level": "debug"}

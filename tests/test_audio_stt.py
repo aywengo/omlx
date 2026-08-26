@@ -326,6 +326,25 @@ class TestAudioUploadLimitSettings:
             assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
         assert "Invalid max_audio_upload_size" in caplog.text
 
+    def test_non_positive_configured_size_warns_and_falls_back(self, caplog):
+        """0MB parses cleanly but would reject every upload; fall back instead."""
+        from omlx.api.audio_routes import (
+            MAX_AUDIO_UPLOAD_BYTES,
+            _max_audio_upload_bytes,
+        )
+        from omlx.settings import ServerSettings
+
+        zero = ServerSettings(max_audio_upload_size="0MB")
+        with (
+            patch(
+                "omlx.settings.get_settings",
+                return_value=type("GS", (), {"server": zero})(),
+            ),
+            caplog.at_level("WARNING", logger="omlx.api.audio_routes"),
+        ):
+            assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
+        assert "Invalid max_audio_upload_size" in caplog.text
+
 
 class TestSTTEndpointBasic:
     """Core STT endpoint behaviour."""

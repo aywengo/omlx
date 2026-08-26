@@ -180,8 +180,11 @@ class ServerSettings:
     max_audio_upload_size: str = "100MB"
 
     def max_audio_upload_bytes(self) -> int:
-        """Configured audio upload limit in bytes."""
-        return parse_size(self.max_audio_upload_size)
+        """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
+        size = parse_size(self.max_audio_upload_size)
+        if size <= 0:
+            raise ValueError("max_audio_upload_size must be positive")
+        return size
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
