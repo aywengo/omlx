@@ -261,6 +261,8 @@ class TestServeCommandOptions:
         assert "--max-concurrent-requests" in result.stdout
         assert "--embedding-batch-size" in result.stdout
         assert "--max-audio-upload-size" in result.stdout
+        assert "settings.json" in result.stdout
+        assert "Default: 100MB" not in result.stdout
 
     def test_serve_has_cache_options(self):
         """Test that serve command has cache options."""

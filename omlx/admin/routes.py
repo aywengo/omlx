@@ -3472,11 +3472,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                     False,
                 )
             ),
-            "max_audio_upload_size": getattr(
-                global_settings.server,
-                "max_audio_upload_size",
-                "100MB",
-            ),
+            "max_audio_upload_size": global_settings.server.max_audio_upload_size,
         },
         "model": {
             "model_dirs": [

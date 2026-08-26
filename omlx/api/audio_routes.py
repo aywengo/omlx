@@ -141,7 +141,14 @@ def _max_audio_upload_bytes() -> int:
         from omlx.settings import get_settings
 
         return get_settings().server.max_audio_upload_bytes()
-    except (RuntimeError, AttributeError, TypeError, ValueError):
+    except RuntimeError:
+        return MAX_AUDIO_UPLOAD_BYTES
+    except (AttributeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Invalid max_audio_upload_size; using %s byte default: %s",
+            MAX_AUDIO_UPLOAD_BYTES,
+            exc,
+        )
         return MAX_AUDIO_UPLOAD_BYTES
 
 

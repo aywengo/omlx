@@ -1076,7 +1076,9 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum audio upload size for /v1/audio/transcriptions and "
-        "/v1/audio/process (e.g. '100MB', '500MB'). Default: 100MB",
+        "/v1/audio/process (e.g. '100MB', '500MB'). Overrides the value "
+        "in settings.json (built-in default: 100MB). Uploads are buffered "
+        "in memory, so this is also a per-request RAM cap",
     )
 
     # Scheduler options (for BatchedEngine)
