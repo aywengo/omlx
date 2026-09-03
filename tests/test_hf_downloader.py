@@ -1751,6 +1751,34 @@ class TestGetRecommendedModels:
         assert item["size_formatted"] == ""
         assert item["repo_id"] == model.id
 
+    @pytest.mark.asyncio
+    async def test_malformed_histogram_does_not_fail_recommended(self):
+        """A None dtype count must not 500 the Recommended listing."""
+        bad = _make_mock_model(
+            "mlx-community/broken",
+            disk_size_bytes=2 * 1024**3,
+            downloads=200,
+        )
+        bad.safetensors = {"parameters": {"BF16": None}, "total": None}
+        good = _make_mock_model(
+            "mlx-community/ok",
+            disk_size_bytes=2 * 1024**3,
+            downloads=200,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [bad, good]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=64 * 1024**3
+            )
+
+        names = [m["name"] for m in result["trending"]]
+        assert "ok" in names
+        assert "broken" in names
+
 
 # =============================================================================
 # Search Models Tests
@@ -2359,6 +2387,11 @@ class TestGetParamCount:
         assert _get_param_count({"parameters": {}}) == 0
         assert _get_param_count({}) == 0
 
+    def test_non_int_count_returns_zero(self):
+        from omlx.admin.hf_downloader import _get_param_count
+
+        assert _get_param_count({"parameters": {"BF16": None}}) == 0
+
 
 class TestCalcSafetensorsDiskSize:
     """Test _calc_safetensors_disk_size helper."""
@@ -2381,6 +2414,15 @@ class TestCalcSafetensorsDiskSize:
 
         assert _calc_safetensors_disk_size({"parameters": {}}) == 0
         assert _calc_safetensors_disk_size({}) == 0
+
+    def test_non_int_count_returns_zero(self):
+        from omlx.admin.hf_downloader import _calc_safetensors_disk_size
+
+        assert _calc_safetensors_disk_size({"parameters": {"BF16": None}}) == 0
+        assert (
+            _calc_safetensors_disk_size({"parameters": {"BF16": 100, "F32": None}})
+            == 0
+        )
 
 
 class TestSafetensorsBlobSize:

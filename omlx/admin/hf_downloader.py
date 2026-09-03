@@ -446,11 +446,20 @@ def _calc_safetensors_disk_size(safetensors: dict) -> int:
 
     Accurate for BF16/F16/F32. Wrong for U32-packed MLX quants: HF reports
     logical parameter counts under U32, not packed word counts (#3401).
+
+    Malformed counts (None, non-int) return 0 rather than raising, so one
+    bad Hub row cannot take down Browse/Search/Recommended.
     """
-    params = safetensors.get("parameters", {})
+    params = safetensors.get("parameters", {}) or {}
     if not params:
         return 0
-    return sum(count * _DTYPE_BYTES.get(dtype, 1) for dtype, count in params.items())
+    try:
+        return sum(
+            int(count) * _DTYPE_BYTES.get(dtype, 1)
+            for dtype, count in params.items()
+        )
+    except (TypeError, ValueError):
+        return 0
 
 
 def _format_model_size(size_bytes: int) -> str:
@@ -476,10 +485,13 @@ def _format_param_count(total_params: int) -> str:
 
 def _get_param_count(safetensors: dict) -> int:
     """Get total parameter count from safetensors metadata."""
-    params = safetensors.get("parameters", {})
+    params = safetensors.get("parameters", {}) or {}
     if not params:
         return 0
-    return sum(params.values())
+    try:
+        return sum(int(count) for count in params.values())
+    except (TypeError, ValueError):
+        return 0
 
 
 # HF API sort field mapping for search.
