@@ -20,8 +20,11 @@ from omlx.admin.hf_downloader import (
     HFDownloader,
     _DownloadActivity,
     _DownloadCancelled,
+    _calc_safetensors_disk_size,
+    _histogram_has_packed_u32,
     _is_xet_transport_error,
     _make_cancellable_tqdm,
+    _sum_safetensors_blob_bytes,
 )
 
 # =============================================================================
@@ -802,6 +805,7 @@ class TestHFDownloader:
             "parameters": {"BF16": 7_000_000_000},
             "total": 7_000_000_000,
         }
+        mock_info.siblings = None
         mock_api.model_info.return_value = mock_info
 
         def fake_snapshot_download(**kwargs):
@@ -824,6 +828,43 @@ class TestHFDownloader:
         # On completion the estimate is dropped in favor of the measured
         # dir size (nothing was written here, so 0), not the 14 GB guess.
         assert task.downloaded_size == 0
+
+    @pytest.mark.asyncio
+    async def test_dry_run_failure_u32_uses_sibling_blob_size(self, model_dir):
+        """U32 histograms must not be billed at 4 bytes/param for the estimate."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-u32-fallback", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {
+            "parameters": {"U32": 25_235_685_376, "BF16": 570_250_830},
+            "total": 25_805_936_206,
+        }
+        weight = MagicMock()
+        weight.rfilename = "model.safetensors"
+        weight.size = 15_400_000_000
+        mock_info.siblings = [weight]
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.total_size == 15_400_000_000
+        assert task.status == DownloadStatus.COMPLETED
 
     @pytest.mark.asyncio
     async def test_dry_run_failure_no_safetensors_leaves_total_size_zero(
@@ -1361,12 +1402,59 @@ def _make_mock_model(
     m.downloads = downloads
     m.likes = likes
     m.trending_score = trending_score
+    m.siblings = None
     if disk_size_bytes is not None:
         param_count = disk_size_bytes // 2
         m.safetensors = {"parameters": {"BF16": param_count}, "total": param_count}
     else:
         m.safetensors = None
     return m
+
+
+def _make_mock_u32_model(
+    repo_id: str,
+    *,
+    downloads: int = 200,
+    likes: int = 0,
+    trending_score: float = 0,
+    u32_count: int = 25_235_685_376,
+    bf16_count: int = 570_250_830,
+    sibling_bytes: int | None = None,
+):
+    """HF list row for a U32-packed MLX quant (logical param counts under U32)."""
+    m = MagicMock()
+    m.id = repo_id
+    m.downloads = downloads
+    m.likes = likes
+    m.trending_score = trending_score
+    total = u32_count + bf16_count
+    m.safetensors = {
+        "parameters": {"U32": u32_count, "BF16": bf16_count},
+        "total": total,
+    }
+    if sibling_bytes is None:
+        m.siblings = None
+    else:
+        weight = MagicMock()
+        weight.rfilename = "model.safetensors"
+        weight.size = sibling_bytes
+        m.siblings = [weight]
+    return m
+
+
+def _blob_info(repo_id: str, size: int, safetensors=None):
+    """model_info(files_metadata=True) result with one weight shard."""
+    info = MagicMock()
+    info.id = repo_id
+    info.safetensors = safetensors
+    sibling = MagicMock()
+    sibling.rfilename = "model.safetensors"
+    sibling.size = size
+    extra = MagicMock()
+    extra.rfilename = "tokenizer.json"
+    extra.size = 1_000_000
+    info.siblings = [sibling, extra]
+    return info
 
 
 class TestGetRecommendedModels:
@@ -1503,6 +1591,7 @@ class TestGetRecommendedModels:
                 max_memory_bytes=64 * 1024**3
             )
 
+        mock_api.model_info.assert_not_called()
         item = result["trending"][0]
         assert item["repo_id"] == "mlx-community/test-model-4bit"
         assert item["name"] == "test-model-4bit"
@@ -1585,6 +1674,82 @@ class TestGetRecommendedModels:
         item = result["trending"][0]
         assert item["params"] == 7_000_000_000
         assert item["params_formatted"] == "7.0B"
+        mock_api.model_info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_u32_quant_uses_blob_size_not_dtype_histogram(self):
+        """U32-packed 4-bit repos must not be billed at 4 bytes/param (#3401)."""
+        blob_bytes = 15_400_000_000
+        model = _make_mock_u32_model(
+            "mlx-community/gemma-4-26B-A4B-it-4bit",
+            downloads=500,
+            trending_score=5,
+        )
+        inflated = _calc_safetensors_disk_size(model.safetensors)
+        assert inflated > 90 * 1024**3
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api.model_info.return_value = _blob_info(
+                model.id, blob_bytes, safetensors=model.safetensors
+            )
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=96 * 1024**3
+            )
+
+        mock_api.model_info.assert_called()
+        assert mock_api.model_info.call_args.kwargs.get("files_metadata") is True
+        item = result["trending"][0]
+        assert item["size"] == blob_bytes
+        assert item["size"] != inflated
+        assert "GB" in item["size_formatted"]
+
+    @pytest.mark.asyncio
+    async def test_u32_quant_skips_model_info_when_siblings_have_sizes(self):
+        blob_bytes = 15_400_000_000
+        model = _make_mock_u32_model(
+            "mlx-community/gemma-4-26B-A4B-it-4bit",
+            downloads=500,
+            sibling_bytes=blob_bytes,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=96 * 1024**3
+            )
+
+        mock_api.model_info.assert_not_called()
+        assert result["trending"][0]["size"] == blob_bytes
+
+    @pytest.mark.asyncio
+    async def test_u32_blob_fetch_failure_keeps_model_on_recommended(self):
+        """Unknown size must not hide a quant the way the inflated estimate did."""
+        model = _make_mock_u32_model(
+            "mlx-community/gemma-4-26B-A4B-it-4bit",
+            downloads=500,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api.model_info.side_effect = RuntimeError("hub down")
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=16 * 1024**3
+            )
+
+        item = result["trending"][0]
+        assert item["size"] == 0
+        assert item["size_formatted"] == ""
+        assert item["repo_id"] == model.id
 
 
 # =============================================================================
@@ -1666,6 +1831,7 @@ class TestSearchModels:
         assert item["likes"] == 42
         assert item["params"] == 3_000_000_000  # 6GB BF16 = 3B params
         assert item["params_formatted"] == "3.0B"
+        mock_api.model_info.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_search_handles_no_safetensors(self):
@@ -1845,6 +2011,26 @@ class TestSearchModels:
         assert len(result["models"]) == 1
         assert result["models"][0]["repo_id"] == "org/medium"
 
+    @pytest.mark.asyncio
+    async def test_search_u32_quant_uses_blob_size(self):
+        blob_bytes = 15_400_000_000
+        model = _make_mock_u32_model("mlx-community/gemma-4-26B-A4B-it-4bit")
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api.model_info.return_value = _blob_info(
+                model.id, blob_bytes, safetensors=model.safetensors
+            )
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="gemma")
+
+        mock_api.model_info.assert_called()
+        item = result["models"][0]
+        assert item["size"] == blob_bytes
+        assert item["size"] < _calc_safetensors_disk_size(model.safetensors)
+
 
 # =============================================================================
 # Stale Token Fallback Tests
@@ -2018,11 +2204,47 @@ class TestGetModelInfo:
         assert result["likes"] == 100
         assert result["params"] == 7_000_000_000
         assert result["params_formatted"] == "7.0B"
+        assert result["size"] == 14_000_000_000
         assert len(result["files"]) == 1
         assert result["files"][0]["name"] == "model.safetensors"
         assert "text-generation" in result["tags"]
         assert result["model_card"] == ""  # No README available
         assert result["is_adapter"] is False
+
+    @pytest.mark.asyncio
+    async def test_u32_size_uses_sibling_blobs_not_histogram(self):
+        mock_info = MagicMock()
+        mock_info.id = "mlx-community/gemma-4-26B-A4B-it-4bit"
+        mock_info.downloads = 1000
+        mock_info.likes = 10
+        mock_info.tags = ["mlx"]
+        mock_info.pipeline_tag = "text-generation"
+        mock_info.created_at = None
+        mock_info.last_modified = None
+        mock_info.safetensors = {
+            "parameters": {"U32": 25_235_685_376, "BF16": 570_250_830},
+            "total": 25_805_936_206,
+        }
+        mock_info.card_data = None
+        weight = MagicMock()
+        weight.rfilename = "model.safetensors"
+        weight.size = 15_400_000_000
+        tokenizer = MagicMock()
+        tokenizer.rfilename = "tokenizer.json"
+        tokenizer.size = 1_000_000
+        mock_info.siblings = [weight, tokenizer]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls, \
+             patch("omlx.admin.hf_downloader.hf_hub_download", side_effect=Exception("no readme")):
+            mock_api = MagicMock()
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_model_info(mock_info.id)
+
+        assert result["size"] == 15_400_000_000
+        assert result["size"] != _calc_safetensors_disk_size(mock_info.safetensors)
+        assert result["params"] == 25_805_936_206
 
     @pytest.mark.asyncio
     async def test_detects_lora_adapter(self):
@@ -2159,6 +2381,40 @@ class TestCalcSafetensorsDiskSize:
 
         assert _calc_safetensors_disk_size({"parameters": {}}) == 0
         assert _calc_safetensors_disk_size({}) == 0
+
+
+class TestSafetensorsBlobSize:
+    """Blob-size helpers for U32-packed MLX quants (#3401)."""
+
+    def test_empty_or_name_only_siblings(self):
+        assert _sum_safetensors_blob_bytes(None) is None
+        assert _sum_safetensors_blob_bytes([]) is None
+        nameless = MagicMock()
+        nameless.rfilename = "model.safetensors"
+        nameless.size = None
+        assert _sum_safetensors_blob_bytes([nameless]) is None
+
+    def test_sums_safetensors_and_ignores_tokenizer(self):
+        weight = MagicMock()
+        weight.rfilename = "model-00001-of-00002.safetensors"
+        weight.size = 10_000_000_000
+        weight2 = MagicMock()
+        weight2.rfilename = "model-00002-of-00002.safetensors"
+        weight2.size = 5_400_000_000
+        tokenizer = MagicMock()
+        tokenizer.rfilename = "tokenizer.json"
+        tokenizer.size = 1_000_000
+        assert _sum_safetensors_blob_bytes([weight, weight2, tokenizer]) == 15_400_000_000
+
+    def test_issue_3401_histogram_is_packed_u32(self):
+        st = {
+            "parameters": {"U32": 25_235_685_376, "BF16": 570_250_830},
+            "total": 25_805_936_206,
+        }
+        assert _histogram_has_packed_u32(st) is True
+        assert _histogram_has_packed_u32({"parameters": {"BF16": 1_000}}) is False
+        inflated = _calc_safetensors_disk_size(st)
+        assert inflated > 90 * 1024**3
 
 
 # =============================================================================
