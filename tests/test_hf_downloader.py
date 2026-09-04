@@ -2087,6 +2087,28 @@ class TestSearchModels:
         assert [m["repo_id"] for m in result["models"]] == ["org/small-bf16"]
 
     @pytest.mark.asyncio
+    async def test_search_skips_blob_fetch_when_param_count_is_zero(self):
+        """0 from a malformed histogram is unknown, not a size that passes max_params."""
+        model = _make_mock_u32_model("mlx-community/unknown-u32")
+        model.safetensors = {
+            "parameters": {"U32": 25_235_685_376, "BF16": None},
+            "total": None,
+        }
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="gemma",
+                max_params=8_000_000_000,
+            )
+
+        mock_api.model_info.assert_not_called()
+        assert result["models"] == []
+
+    @pytest.mark.asyncio
     async def test_search_reuses_cached_blob_size(self):
         blob_bytes = 15_400_000_000
         model = _make_mock_u32_model("mlx-community/gemma-4-26B-A4B-it-4bit")
@@ -2503,6 +2525,32 @@ class TestSafetensorsBlobSize:
         assert _histogram_has_packed_u32({"parameters": {"BF16": 1_000}}) is False
         inflated = _calc_safetensors_disk_size(st)
         assert inflated > 90 * 1024**3
+
+    def test_store_blob_size_drops_expired_entries(self):
+        now = time.monotonic()
+        expired_at = now - hf_downloader_mod._BLOB_SIZE_CACHE_TTL - 1
+        hf_downloader_mod._blob_size_cache["old/a"] = (100, expired_at)
+        hf_downloader_mod._blob_size_cache["old/b"] = (200, expired_at)
+
+        hf_downloader_mod._store_blob_size("fresh/c", 15_400_000_000)
+
+        assert set(hf_downloader_mod._blob_size_cache) == {"fresh/c"}
+        assert hf_downloader_mod._cached_blob_size("fresh/c") == 15_400_000_000
+
+    def test_store_blob_size_caps_cache_length(self):
+        with patch.object(hf_downloader_mod, "_BLOB_SIZE_CACHE_MAX", 3):
+            for i in range(5):
+                hf_downloader_mod._store_blob_size(f"org/m{i}", 1000 + i)
+
+            assert len(hf_downloader_mod._blob_size_cache) == 3
+            assert "org/m0" not in hf_downloader_mod._blob_size_cache
+            assert "org/m1" not in hf_downloader_mod._blob_size_cache
+            assert hf_downloader_mod._cached_blob_size("org/m4") == 1004
+
+    def test_store_blob_size_ignores_non_positive(self):
+        hf_downloader_mod._store_blob_size("org/zero", 0)
+        hf_downloader_mod._store_blob_size("org/neg", -1)
+        assert hf_downloader_mod._blob_size_cache == {}
 
 
 # =============================================================================

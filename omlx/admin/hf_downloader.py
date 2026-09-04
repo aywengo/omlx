@@ -318,6 +318,7 @@ _MIN_DOWNLOADS = 100
 _BLOB_FETCH_CONCURRENCY = 8
 _BLOB_FETCH_BATCH_TIMEOUT = 15
 _BLOB_SIZE_CACHE_TTL = 3600.0
+_BLOB_SIZE_CACHE_MAX = 512
 _blob_size_cache: dict[str, tuple[int, float]] = {}
 
 
@@ -394,10 +395,29 @@ def _cached_blob_size(repo_id: str) -> int | None:
     return size
 
 
+def _prune_blob_size_cache() -> None:
+    """Drop expired entries, then the oldest if still over the cap."""
+    now = time.monotonic()
+    expired = [
+        repo_id
+        for repo_id, (_, stored_at) in _blob_size_cache.items()
+        if now - stored_at > _BLOB_SIZE_CACHE_TTL
+    ]
+    for repo_id in expired:
+        _blob_size_cache.pop(repo_id, None)
+    overflow = len(_blob_size_cache) - _BLOB_SIZE_CACHE_MAX
+    if overflow <= 0:
+        return
+    oldest = sorted(_blob_size_cache.items(), key=lambda item: item[1][1])
+    for repo_id, _ in oldest[:overflow]:
+        _blob_size_cache.pop(repo_id, None)
+
+
 def _store_blob_size(repo_id: str, size: int) -> None:
     """Cache Hub blob sizes that actually resolved. Failures stay uncached."""
     if size > 0:
         _blob_size_cache[repo_id] = (size, time.monotonic())
+        _prune_blob_size_cache()
 
 
 async def _blob_bytes_for_repos(api: HfApi, repo_ids: list[str]) -> dict[str, int]:
@@ -422,9 +442,8 @@ async def _blob_bytes_for_repos(api: HfApi, repo_ids: list[str]) -> dict[str, in
     async def _one(repo_id: str) -> tuple[str, int]:
         async with semaphore:
             try:
-                size = await asyncio.wait_for(
-                    asyncio.to_thread(_fetch_safetensors_blob_bytes, api, repo_id),
-                    timeout=_HF_API_TIMEOUT,
+                size = await asyncio.to_thread(
+                    _fetch_safetensors_blob_bytes, api, repo_id
                 )
                 return repo_id, size
             except Exception:
@@ -713,9 +732,7 @@ class HFDownloader:
             params = None
             st_params = _safetensors_parameters(getattr(m, "safetensors", None))
             if st_params:
-                params = _get_param_count({"parameters": st_params})
-                if params and params <= 0:
-                    params = None
+                params = _get_param_count({"parameters": st_params}) or None
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
