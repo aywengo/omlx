@@ -317,6 +317,8 @@ _MIN_DOWNLOADS = 100
 # Follow-up model_info(files_metadata=True) calls for U32-packed repos.
 _BLOB_FETCH_CONCURRENCY = 8
 _BLOB_FETCH_BATCH_TIMEOUT = 15
+_BLOB_SIZE_CACHE_TTL = 3600.0
+_blob_size_cache: dict[str, tuple[int, float]] = {}
 
 
 def _safetensors_parameters(safetensors) -> dict:
@@ -380,11 +382,40 @@ def _fetch_safetensors_blob_bytes(api: HfApi, repo_id: str) -> int:
     return _sum_safetensors_blob_bytes(getattr(info, "siblings", None)) or 0
 
 
+def _cached_blob_size(repo_id: str) -> int | None:
+    """Return a still-fresh cached positive blob size, or None."""
+    entry = _blob_size_cache.get(repo_id)
+    if entry is None:
+        return None
+    size, stored_at = entry
+    if time.monotonic() - stored_at > _BLOB_SIZE_CACHE_TTL:
+        _blob_size_cache.pop(repo_id, None)
+        return None
+    return size
+
+
+def _store_blob_size(repo_id: str, size: int) -> None:
+    """Cache Hub blob sizes that actually resolved. Failures stay uncached."""
+    if size > 0:
+        _blob_size_cache[repo_id] = (size, time.monotonic())
+
+
 async def _blob_bytes_for_repos(api: HfApi, repo_ids: list[str]) -> dict[str, int]:
     """Fetch blob sizes for U32-packed repos, concurrently, with a batch cap."""
     unique_ids = list(dict.fromkeys(repo_ids))
     if not unique_ids:
         return {}
+
+    sizes: dict[str, int] = {}
+    to_fetch: list[str] = []
+    for repo_id in unique_ids:
+        cached = _cached_blob_size(repo_id)
+        if cached is not None:
+            sizes[repo_id] = cached
+        else:
+            to_fetch.append(repo_id)
+    if not to_fetch:
+        return sizes
 
     semaphore = asyncio.Semaphore(_BLOB_FETCH_CONCURRENCY)
 
@@ -399,7 +430,7 @@ async def _blob_bytes_for_repos(api: HfApi, repo_ids: list[str]) -> dict[str, in
             except Exception:
                 return repo_id, 0
 
-    tasks = [asyncio.create_task(_one(repo_id)) for repo_id in unique_ids]
+    tasks = [asyncio.create_task(_one(repo_id)) for repo_id in to_fetch]
     done, pending = await asyncio.wait(tasks, timeout=_BLOB_FETCH_BATCH_TIMEOUT)
     for task in pending:
         task.cancel()
@@ -410,13 +441,15 @@ async def _blob_bytes_for_repos(api: HfApi, repo_ids: list[str]) -> dict[str, in
             len(pending),
         )
 
-    sizes: dict[str, int] = {repo_id: 0 for repo_id in unique_ids}
+    for repo_id in to_fetch:
+        sizes.setdefault(repo_id, 0)
     for task in done:
         try:
             repo_id, size = task.result()
         except Exception:
             continue
         sizes[repo_id] = size
+        _store_blob_size(repo_id, size)
     return sizes
 
 
@@ -583,7 +616,7 @@ class HFDownloader:
                 if not _eligible(model):
                     continue
                 size = _list_disk_size(model, blob_sizes)
-                if size > max_memory_bytes:
+                if size <= 0 or size > max_memory_bytes:
                     continue
                 params = _get_param_count(
                     {"parameters": _safetensors_parameters(model.safetensors)}
@@ -675,28 +708,33 @@ class HFDownloader:
             timeout=_HF_API_TIMEOUT,
         )
 
-        need_blob = [m.id for m in models if _needs_u32_blob_fetch(m)]
-        blob_sizes = await _blob_bytes_for_repos(api, need_blob)
-
-        results = []
+        pending: list[tuple[object, int | None, dict]] = []
         for m in models:
             params = None
-            params_formatted = None
-            size = 0
-
             st_params = _safetensors_parameters(getattr(m, "safetensors", None))
             if st_params:
                 params = _get_param_count({"parameters": st_params})
-                params_formatted = _format_param_count(params) if params > 0 else None
-                size = _list_disk_size(m, blob_sizes)
                 if params and params <= 0:
                     params = None
-
-            # Apply filters
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
                 continue
+            pending.append((m, params, st_params))
+
+        need_blob = [m.id for m, _, _ in pending if _needs_u32_blob_fetch(m)]
+        blob_sizes = await _blob_bytes_for_repos(api, need_blob)
+
+        results = []
+        for m, params, st_params in pending:
+            size = 0
+            params_formatted = None
+            if st_params:
+                params_formatted = (
+                    _format_param_count(params) if params and params > 0 else None
+                )
+                size = _list_disk_size(m, blob_sizes)
+
             if min_size is not None and size < min_size:
                 continue
             if max_size is not None and size > max_size:

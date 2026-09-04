@@ -14,6 +14,7 @@ import pytest
 from huggingface_hub.utils import HfHubHTTPError
 
 from omlx._hf_download_worker import _download_without_xet
+from omlx.admin import hf_downloader as hf_downloader_mod
 from omlx.admin.hf_downloader import (
     DownloadStatus,
     DownloadTask,
@@ -26,6 +27,13 @@ from omlx.admin.hf_downloader import (
     _make_cancellable_tqdm,
     _sum_safetensors_blob_bytes,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_blob_size_cache():
+    hf_downloader_mod._blob_size_cache.clear()
+    yield
+    hf_downloader_mod._blob_size_cache.clear()
 
 # =============================================================================
 # DownloadTask Tests
@@ -1729,8 +1737,8 @@ class TestGetRecommendedModels:
         assert result["trending"][0]["size"] == blob_bytes
 
     @pytest.mark.asyncio
-    async def test_u32_blob_fetch_failure_keeps_model_on_recommended(self):
-        """Unknown size must not hide a quant the way the inflated estimate did."""
+    async def test_u32_blob_fetch_failure_excludes_from_recommended(self):
+        """Unknown size must not appear on Recommended (memory-fit list)."""
         model = _make_mock_u32_model(
             "mlx-community/gemma-4-26B-A4B-it-4bit",
             downloads=500,
@@ -1746,10 +1754,8 @@ class TestGetRecommendedModels:
                 max_memory_bytes=16 * 1024**3
             )
 
-        item = result["trending"][0]
-        assert item["size"] == 0
-        assert item["size_formatted"] == ""
-        assert item["repo_id"] == model.id
+        assert result["trending"] == []
+        assert result["popular"] == []
 
     @pytest.mark.asyncio
     async def test_malformed_histogram_does_not_fail_recommended(self):
@@ -1777,7 +1783,7 @@ class TestGetRecommendedModels:
 
         names = [m["name"] for m in result["trending"]]
         assert "ok" in names
-        assert "broken" in names
+        assert "broken" not in names
 
 
 # =============================================================================
@@ -2058,6 +2064,46 @@ class TestSearchModels:
         item = result["models"][0]
         assert item["size"] == blob_bytes
         assert item["size"] < _calc_safetensors_disk_size(model.safetensors)
+
+    @pytest.mark.asyncio
+    async def test_search_skips_blob_fetch_for_param_filtered_u32(self):
+        """min/max params run before model_info so oversize U32 rows stay off Hub."""
+        huge = _make_mock_u32_model("mlx-community/huge-u32")
+        small = _make_mock_model(
+            "org/small-bf16", disk_size_bytes=2_000_000_000, downloads=100
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [huge, small]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model",
+                max_params=8_000_000_000,
+            )
+
+        mock_api.model_info.assert_not_called()
+        assert [m["repo_id"] for m in result["models"]] == ["org/small-bf16"]
+
+    @pytest.mark.asyncio
+    async def test_search_reuses_cached_blob_size(self):
+        blob_bytes = 15_400_000_000
+        model = _make_mock_u32_model("mlx-community/gemma-4-26B-A4B-it-4bit")
+        info = _blob_info(model.id, blob_bytes, safetensors=model.safetensors)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api.model_info.return_value = info
+            mock_api_cls.return_value = mock_api
+
+            first = await HFDownloader.search_models(query="gemma")
+            second = await HFDownloader.search_models(query="gemma")
+
+        assert mock_api.model_info.call_count == 1
+        assert first["models"][0]["size"] == blob_bytes
+        assert second["models"][0]["size"] == blob_bytes
 
 
 # =============================================================================
