@@ -254,6 +254,10 @@ class ThinkingParser:
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
+        # Chat templates open a block with ``<think>\n``. That newline is
+        # template scaffolding, not reasoning, and it shows up as a blank
+        # first line if the first delta keeps it.
+        self._skip_leading_newlines: bool = start_in_thinking
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -283,11 +287,13 @@ class ThinkingParser:
                 # Try to match <think>
                 if remaining.startswith(_OPEN_TAG):
                     self._in_thinking = True
+                    self._skip_leading_newlines = True
                     i += _OPEN_LEN
                     continue
 
                 if remaining.startswith(_HY3_OPEN_TAG):
                     self._in_thinking = True
+                    self._skip_leading_newlines = True
                     i += len(_HY3_OPEN_TAG)
                     continue
 
@@ -312,13 +318,13 @@ class ThinkingParser:
 
                 # Not a tag, emit the '<' as regular content
                 if self._in_thinking:
-                    thinking_out.append('<')
+                    self._append_thinking("<", thinking_out)
                 else:
                     content_out.append('<')
                 i += 1
             else:
                 if self._in_thinking:
-                    thinking_out.append(text[i])
+                    self._append_thinking(text[i], thinking_out)
                 else:
                     content_out.append(text[i])
                 i += 1
@@ -373,6 +379,14 @@ class ThinkingParser:
         else:
             self._content_emitted = True
             return ("", partial)
+
+    def _append_thinking(self, char: str, thinking_out: List[str]) -> None:
+        """Append one thinking character, skipping newlines that open the block."""
+        if self._skip_leading_newlines:
+            if char == "\n":
+                return
+            self._skip_leading_newlines = False
+        thinking_out.append(char)
 
     @staticmethod
     def _could_be_tag(text: str) -> bool:

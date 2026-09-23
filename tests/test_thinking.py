@@ -344,6 +344,32 @@ class TestThinkingParser:
         assert "<think>" not in thinking
         assert "</think>" not in content
 
+    def test_drops_newlines_that_open_a_thinking_block(self):
+        """The template's ``<think>\\n`` is not part of the reasoning text.
+
+        Newlines later in the block stay. A later block drops its own
+        leading newlines again.
+        """
+        parser = ThinkingParser()
+        assert parser.feed("<think>\n") == ("", "")
+        assert parser.feed("\nThe user asks\n") == ("The user asks\n", "")
+        assert parser.feed("next line</think>\nanswer") == (
+            "next line",
+            "\nanswer",
+        )
+
+        again = ThinkingParser()
+        thinking, content = again.feed(
+            "<think>\nfirst</think>answer<think>\n\nsecond"
+        )
+        assert thinking == "firstsecond"
+        assert content == "answer"
+
+    def test_start_in_thinking_drops_leading_newlines(self):
+        """Prompt-opened thinking still begins at the first real character."""
+        parser = ThinkingParser(start_in_thinking=True)
+        assert parser.feed("\n\nfirst") == ("first", "")
+
     def test_start_in_thinking_streams_as_thinking(self):
         """start_in_thinking=True: feed() treats incoming text as thinking
         until a </think> tag arrives."""
